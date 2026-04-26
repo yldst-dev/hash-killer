@@ -4,6 +4,8 @@ use crate::duplicate_cleaner::CleanReport;
 #[cfg(not(target_arch = "wasm32"))]
 use rusqlite::{params, Connection, OptionalExtension};
 #[cfg(not(target_arch = "wasm32"))]
+use std::env;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
@@ -14,6 +16,8 @@ use std::time::Duration;
 const DEFAULT_CACHE_LIMIT_MB: u64 = 256;
 #[cfg(not(target_arch = "wasm32"))]
 const CACHE_PRUNE_TARGET_RATIO: u64 = 80;
+#[cfg(not(target_arch = "wasm32"))]
+const STATE_DIR_ENV: &str = "HASH_KILLER_STATE_DIR";
 
 #[cfg(target_arch = "wasm32")]
 const DEFAULT_CACHE_LIMIT_MB: u64 = 256;
@@ -330,9 +334,54 @@ pub fn save_run_snapshot(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn cache_db_path() -> Result<PathBuf, String> {
-    std::env::current_dir()
-        .map(|path| path.join("hash-killer.sqlite3"))
-        .map_err(|error| error.to_string())
+    let directory = state_directory()?;
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    Ok(directory.join("hash-killer.sqlite3"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn state_directory() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os(STATE_DIR_ENV) {
+        return Ok(PathBuf::from(path));
+    }
+
+    platform_state_directory()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+fn platform_state_directory() -> Result<PathBuf, String> {
+    env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("hash-killer"))
+        .ok_or_else(|| "APPDATA 환경 변수를 찾을 수 없습니다.".to_string())
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
+fn platform_state_directory() -> Result<PathBuf, String> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|path| {
+            path.join("Library")
+                .join("Application Support")
+                .join("hash-killer")
+        })
+        .ok_or_else(|| "HOME 환경 변수를 찾을 수 없습니다.".to_string())
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(target_os = "windows"),
+    not(target_os = "macos")
+))]
+fn platform_state_directory() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(path).join("hash-killer"));
+    }
+
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|path| path.join(".local").join("share").join("hash-killer"))
+        .ok_or_else(|| "HOME 환경 변수를 찾을 수 없습니다.".to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]

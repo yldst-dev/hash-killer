@@ -12,9 +12,12 @@ use futures_timer::Delay;
 use futures_util::StreamExt;
 #[cfg(target_arch = "wasm32")]
 use gloo_timers::future::TimeoutFuture;
+#[cfg(any(not(target_arch = "wasm32"), test))]
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
+#[cfg(any(not(target_arch = "wasm32"), test))]
 use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone)]
@@ -659,7 +662,16 @@ pub fn App() -> Element {
                                 class: "shadcn-button shadcn-button-default",
                                 onclick: move |_| {
                                     close_dialog(scan_confirm_open, dialog_closing);
-                                    start_scan(root_paths, status, report, running, hash_algorithm, scan_mode, activity_events, scan_progress);
+                                    start_scan(ScanSignals {
+                                        root_paths,
+                                        status,
+                                        report,
+                                        running,
+                                        hash_algorithm,
+                                        scan_mode,
+                                        activity_events,
+                                        scan_progress,
+                                    });
                                 },
                                 "예"
                             }
@@ -1326,10 +1338,12 @@ fn write_log_file(file_name: &str, content: String, mut status: Signal<String>) 
     }
 }
 
+#[cfg(any(not(target_arch = "wasm32"), test))]
 fn normalize_log_content(content: &str) -> String {
     content.nfc().collect()
 }
 
+#[cfg(any(not(target_arch = "wasm32"), test))]
 fn format_activity_log(events: &[duplicate_cleaner::ActivityEvent]) -> String {
     let mut lines = Vec::new();
     lines.push("hash-killer 실시간 작업 로그".to_string());
@@ -1338,10 +1352,10 @@ fn format_activity_log(events: &[duplicate_cleaner::ActivityEvent]) -> String {
 
     for (index, event) in events.iter().enumerate() {
         lines.push(format!("{}. {}", index + 1, event.stage));
-        lines.push(format!("상세: {}", event.detail));
+        lines.push(format!("상세: {}", redact_log_text(&event.detail)));
 
         if let Some(path) = &event.path {
-            lines.push(format!("경로: {path}"));
+            lines.push(format!("경로: {}", redact_path(path)));
         }
 
         lines.push(String::new());
@@ -1350,6 +1364,7 @@ fn format_activity_log(events: &[duplicate_cleaner::ActivityEvent]) -> String {
     lines.join("\n")
 }
 
+#[cfg(any(not(target_arch = "wasm32"), test))]
 fn format_duplicate_relations_log(report: &duplicate_cleaner::CleanReport) -> String {
     let same_name_count = report
         .duplicate_relations
@@ -1379,17 +1394,56 @@ fn format_duplicate_relations_log(report: &duplicate_cleaner::CleanReport) -> St
             "분류: {}",
             duplicate_relation_kind_label(relation.kind)
         ));
-        lines.push(format!("원본 파일: {}", relation.original_path));
-        lines.push(format!("중복 파일: {}", relation.duplicate_path));
-        lines.push(format!("보관 위치: {}", relation.current_duplicate_path));
+        lines.push(format!(
+            "원본 파일: {}",
+            redact_path(&relation.original_path)
+        ));
+        lines.push(format!(
+            "중복 파일: {}",
+            redact_path(&relation.duplicate_path)
+        ));
+        lines.push(format!(
+            "보관 위치: {}",
+            redact_path(&relation.current_duplicate_path)
+        ));
         lines.push(format!("용량: {}", format_bytes(relation.size)));
-        lines.push(format!("해시: {}", relation.hash));
+        lines.push(format!("해시: {}", compact_hash_label(&relation.hash)));
         lines.push(String::new());
     }
 
     lines.join("\n")
 }
 
+#[cfg(any(not(target_arch = "wasm32"), test))]
+fn redact_log_text(value: &str) -> String {
+    if value.contains('/') || value.contains('\\') {
+        redact_path(value)
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(any(not(target_arch = "wasm32"), test))]
+fn redact_path(value: &str) -> String {
+    let normalized = value.replace('\\', "/");
+    let file_name = Path::new(&normalized)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            normalized
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .map(str::to_string)
+        });
+
+    match file_name {
+        Some(file_name) => format!(".../{file_name}"),
+        None => "[경로 마스킹됨]".to_string(),
+    }
+}
+
+#[cfg(any(not(target_arch = "wasm32"), test))]
 fn duplicate_relation_kind_label(kind: duplicate_cleaner::DuplicateRelationKind) -> &'static str {
     match kind {
         duplicate_cleaner::DuplicateRelationKind::SameNameAndSize => "같은 이름+용량",
@@ -1413,6 +1467,18 @@ fn toggle_path_selection(
     }
 
     path_remove_selection.set(selected_paths);
+}
+
+#[derive(Clone, Copy)]
+struct ScanSignals {
+    root_paths: Signal<Vec<String>>,
+    status: Signal<String>,
+    report: Signal<Option<duplicate_cleaner::CleanReport>>,
+    running: Signal<bool>,
+    hash_algorithm: Signal<HashAlgorithm>,
+    scan_mode: Signal<ScanMode>,
+    activity_events: Signal<Vec<duplicate_cleaner::ActivityEvent>>,
+    scan_progress: Signal<Option<ScanProgressState>>,
 }
 
 fn remove_selected_paths(
@@ -1566,16 +1632,17 @@ fn reset_completed_scan_settings(mut root_paths: Signal<Vec<String>>, mut status
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn start_scan(
-    root_paths: Signal<Vec<String>>,
-    mut status: Signal<String>,
-    mut report: Signal<Option<duplicate_cleaner::CleanReport>>,
-    mut running: Signal<bool>,
-    hash_algorithm: Signal<HashAlgorithm>,
-    scan_mode: Signal<ScanMode>,
-    mut activity_events: Signal<Vec<duplicate_cleaner::ActivityEvent>>,
-    mut scan_progress: Signal<Option<ScanProgressState>>,
-) {
+fn start_scan(signals: ScanSignals) {
+    let ScanSignals {
+        root_paths,
+        mut status,
+        mut report,
+        mut running,
+        hash_algorithm,
+        scan_mode,
+        mut activity_events,
+        mut scan_progress,
+    } = signals;
     let roots = root_paths();
 
     if roots.is_empty() {
@@ -1658,16 +1725,17 @@ fn start_scan(
 }
 
 #[cfg(target_arch = "wasm32")]
-fn start_scan(
-    root_paths: Signal<Vec<String>>,
-    mut status: Signal<String>,
-    mut report: Signal<Option<duplicate_cleaner::CleanReport>>,
-    mut running: Signal<bool>,
-    hash_algorithm: Signal<HashAlgorithm>,
-    scan_mode: Signal<ScanMode>,
-    mut activity_events: Signal<Vec<duplicate_cleaner::ActivityEvent>>,
-    mut scan_progress: Signal<Option<ScanProgressState>>,
-) {
+fn start_scan(signals: ScanSignals) {
+    let ScanSignals {
+        root_paths,
+        mut status,
+        mut report,
+        mut running,
+        hash_algorithm,
+        scan_mode,
+        mut activity_events,
+        mut scan_progress,
+    } = signals;
     let roots = root_paths();
 
     if roots.is_empty() {
@@ -1736,4 +1804,49 @@ fn push_activity_event(
     }
 
     activity_events.set(events);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_log_redacts_paths() {
+        let events = vec![duplicate_cleaner::ActivityEvent::new(
+            "해시 계산",
+            "/Users/example/Documents/private/file.txt",
+            Some("/Users/example/Documents/private/file.txt".to_string()),
+        )];
+
+        let log = format_activity_log(&events);
+
+        assert!(log.contains(".../file.txt"));
+        assert!(!log.contains("/Users/example"));
+        assert!(!log.contains("private"));
+    }
+
+    #[test]
+    fn duplicate_relation_log_redacts_paths_and_hash() {
+        let report = duplicate_cleaner::CleanReport {
+            reclaimed_bytes: 10,
+            duplicate_relations: vec![duplicate_cleaner::DuplicateRelation {
+                original_path: "/Users/example/Documents/private/original.txt".to_string(),
+                duplicate_path: "/Users/example/Documents/private/duplicate.txt".to_string(),
+                current_duplicate_path: "/Users/example/Archive/private/duplicate.txt".to_string(),
+                size: 10,
+                hash: "0123456789abcdef0123456789abcdef".to_string(),
+                kind: duplicate_cleaner::DuplicateRelationKind::SameSizeAndHash,
+            }],
+            ..duplicate_cleaner::CleanReport::default()
+        };
+
+        let log = format_duplicate_relations_log(&report);
+
+        assert!(log.contains(".../original.txt"));
+        assert!(log.contains(".../duplicate.txt"));
+        assert!(log.contains("0123456789abcd..."));
+        assert!(!log.contains("/Users/example"));
+        assert!(!log.contains("private"));
+        assert!(!log.contains("0123456789abcdef0123456789abcdef"));
+    }
 }

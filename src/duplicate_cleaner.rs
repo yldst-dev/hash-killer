@@ -10,6 +10,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+use std::os::unix::fs::MetadataExt;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -25,6 +27,18 @@ struct FileEntry {
     canonical_path: String,
     size: u64,
     modified_ns: i64,
+    fingerprint: FileFingerprint,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileFingerprint {
+    size: u64,
+    modified_ns: i64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -88,6 +102,7 @@ impl ActivityEvent {
         }
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn with_progress(
         stage: impl Into<String>,
         detail: impl Into<String>,
@@ -175,11 +190,14 @@ where
             Some(root.display().to_string()),
         ));
 
-        if !root.exists() {
-            return Err("입력한 경로가 존재하지 않습니다.".to_string());
+        let metadata = fs::symlink_metadata(root)
+            .map_err(|_| "입력한 경로가 존재하지 않습니다.".to_string())?;
+
+        if metadata.file_type().is_symlink() {
+            return Err("심볼릭 링크 경로는 검사할 수 없습니다.".to_string());
         }
 
-        if !root.is_dir() {
+        if !metadata.is_dir() {
             return Err("디렉터리 경로를 입력해야 합니다.".to_string());
         }
     }
@@ -231,7 +249,7 @@ where
 
     for (index, entry) in candidates.into_iter().enumerate() {
         let completed = index + 1;
-        if index == 0 || index % 64 == 0 {
+        if index == 0 || index.is_multiple_of(64) {
             progress(ActivityEvent::with_progress(
                 "캐시 확인",
                 entry.canonical_path.clone(),
@@ -456,7 +474,7 @@ fn collect_files(
             }
 
             seen += 1;
-            if seen == 1 || seen % 64 == 0 {
+            if seen == 1 || seen.is_multiple_of(64) {
                 progress(ActivityEvent::new(
                     "파일 검색",
                     path.display().to_string(),
@@ -464,7 +482,11 @@ fn collect_files(
                 ));
             }
 
-            let metadata = fs::metadata(&path).ok()?;
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if metadata.file_type().is_symlink() {
+                return None;
+            }
+
             if !metadata.is_file() {
                 return None;
             }
@@ -479,18 +501,14 @@ fn collect_files(
                 return None;
             }
 
-            let modified_ns = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
-                .unwrap_or_default();
+            let modified_ns = modified_ns(&metadata);
 
             Some(FileEntry {
                 path,
                 canonical_path,
                 size: metadata.len(),
                 modified_ns,
+                fingerprint: FileFingerprint::from_metadata(&metadata, modified_ns),
             })
         })
         .collect()
@@ -675,10 +693,57 @@ fn move_to_quarantine(
     }
 
     fs::create_dir_all(target).map_err(|error| error.to_string())?;
+    verify_file_fingerprint(entry)?;
 
     let destination = unique_destination(target, &entry.path);
+    if destination.symlink_metadata().is_ok() {
+        return Err("보관 위치에 같은 이름의 파일이 이미 있습니다.".to_string());
+    }
+
     fs::rename(&entry.path, &destination).map_err(|error| error.to_string())?;
     Ok(destination)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verify_file_fingerprint(entry: &FileEntry) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(&entry.path).map_err(|error| error.to_string())?;
+
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("중복 파일이 일반 파일이 아닙니다.".to_string());
+    }
+
+    let modified_ns = modified_ns(&metadata);
+    let current = FileFingerprint::from_metadata(&metadata, modified_ns);
+
+    if current != entry.fingerprint {
+        return Err("중복 파일이 검사 이후 변경되어 이동하지 않았습니다.".to_string());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn modified_ns(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FileFingerprint {
+    fn from_metadata(metadata: &fs::Metadata, modified_ns: i64) -> Self {
+        Self {
+            size: metadata.len(),
+            modified_ns,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -701,5 +766,178 @@ fn unique_destination(target: &Path, source: &Path) -> PathBuf {
         }
 
         index += 1;
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("hash-killer-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    fn write_file(path: &Path, content: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        fs::write(path, content).unwrap();
+    }
+
+    fn entry_for(path: &Path) -> FileEntry {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        let modified_ns = modified_ns(&metadata);
+        FileEntry {
+            path: path.to_path_buf(),
+            canonical_path: fs::canonicalize(path).unwrap().display().to_string(),
+            size: metadata.len(),
+            modified_ns,
+            fingerprint: FileFingerprint::from_metadata(&metadata, modified_ns),
+        }
+    }
+
+    #[test]
+    fn collect_files_excludes_quarantine_target() {
+        let root = temp_path("exclude-quarantine");
+        let quarantine = root.join("quarantine");
+        let kept = root.join("kept.txt");
+        let ignored = quarantine.join("ignored.txt");
+        write_file(&kept, b"same");
+        write_file(&ignored, b"same");
+        let excluded = vec![fs::canonicalize(&quarantine).unwrap()];
+
+        let files = collect_files(&root, &excluded, &|_| {});
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].canonical_path,
+            fs::canonicalize(&kept).unwrap().display().to_string()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_excludes_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("exclude-symlink");
+        let outside = temp_path("outside-symlink");
+        let real = root.join("real.txt");
+        let outside_file = outside.join("outside.txt");
+        let symlink_file = root.join("linked-file.txt");
+        let symlink_dir = root.join("linked-dir");
+        write_file(&real, b"real");
+        write_file(&outside_file, b"outside");
+        symlink(&outside_file, &symlink_file).unwrap();
+        symlink(&outside, &symlink_dir).unwrap();
+
+        let files = collect_files(&root, &[], &|_| {});
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].canonical_path,
+            fs::canonicalize(&real).unwrap().display().to_string()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn move_to_quarantine_rejects_changed_file() {
+        let root = temp_path("changed-file");
+        let quarantine = root.join("quarantine");
+        let duplicate = root.join("duplicate.txt");
+        write_file(&duplicate, b"before");
+        let entry = entry_for(&duplicate);
+        write_file(&duplicate, b"after-change");
+        let mut targets = HashMap::new();
+        targets.insert(
+            crate::quarantine::volume_key(&duplicate),
+            quarantine.clone(),
+        );
+
+        let result = move_to_quarantine(&entry, &targets);
+
+        assert!(result.is_err());
+        assert!(duplicate.exists());
+        assert!(!quarantine.join("duplicate.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_to_quarantine_rejects_replaced_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("replaced-symlink");
+        let outside = temp_path("outside-replaced-symlink");
+        let quarantine = root.join("quarantine");
+        let duplicate = root.join("duplicate.txt");
+        let outside_file = outside.join("outside.txt");
+        write_file(&duplicate, b"duplicate");
+        write_file(&outside_file, b"duplicate");
+        let entry = entry_for(&duplicate);
+        fs::remove_file(&duplicate).unwrap();
+        symlink(&outside_file, &duplicate).unwrap();
+        let mut targets = HashMap::new();
+        targets.insert(
+            crate::quarantine::volume_key(&duplicate),
+            quarantine.clone(),
+        );
+
+        let result = move_to_quarantine(&entry, &targets);
+
+        assert!(result.is_err());
+        assert!(outside_file.exists());
+        assert!(duplicate.exists());
+        assert!(!quarantine.join("duplicate.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_duplicate_groups_skips_hardlinked_duplicates() {
+        let root = temp_path("hardlink");
+        let quarantine = root.join("quarantine");
+        let original = root.join("original.txt");
+        let duplicate = root.join("duplicate.txt");
+        write_file(&original, b"same");
+        fs::hard_link(&original, &duplicate).unwrap();
+        let hash = "hash".to_string();
+        let files = vec![
+            HashedFile {
+                entry: entry_for(&original),
+                hash: hash.clone(),
+                reused: false,
+            },
+            HashedFile {
+                entry: entry_for(&duplicate),
+                hash,
+                reused: false,
+            },
+        ];
+        let mut targets = HashMap::new();
+        targets.insert(crate::quarantine::volume_key(&root), quarantine);
+
+        let result = delete_duplicate_groups(files, &targets, &|_| {});
+
+        assert_eq!(result.deleted_files, 0);
+        assert_eq!(result.reclaimed_bytes, 0);
+        assert!(result.duplicate_relations.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
