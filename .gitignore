@@ -1,0 +1,10 @@
+target/
+dist/
+.dioxus/
+.DS_Store
+*.log
+*.tmp
+*.temp
+*.rs.bk
+hash-killer.sqlite3
+hash-killer.sqlite3-*

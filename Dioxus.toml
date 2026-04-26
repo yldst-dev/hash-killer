@@ -1,0 +1,17 @@
+[application]
+name = "hash-killer"
+default_platform = "desktop"
+asset_dir = "assets"
+out_dir = "dist"
+
+[web.app]
+title = "hash-killer"
+
+[web.watcher]
+watch_path = ["src", "assets"]
+reload_html = true
+
+[bundle]
+identifier = "com.hash-killer.app"
+publisher = "hash-killer"
+version = "0.1.0"
