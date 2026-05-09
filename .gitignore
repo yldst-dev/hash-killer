@@ -8,3 +8,9 @@ dist/
 *.rs.bk
 hash-killer.sqlite3
 hash-killer.sqlite3-*
+apps/flutter/.dart_tool/
+apps/flutter/build/
+apps/flutter/.flutter-plugins
+apps/flutter/.flutter-plugins-dependencies
+apps/flutter/.idea/
+apps/flutter/*.iml

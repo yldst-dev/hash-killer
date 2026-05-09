@@ -1,0 +1,105 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/flutter-dart-rust-frontend
+    paths:
+      - .github/workflows/windows-build.yml
+      - apps/flutter/**
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable Windows desktop
+        working-directory: apps/flutter
+        run: flutter config --enable-windows-desktop
+
+      - name: Install Flutter dependencies
+        working-directory: apps/flutter
+        run: flutter pub get
+
+      - name: Analyze Flutter app
+        working-directory: apps/flutter
+        run: flutter analyze
+
+      - name: Test Flutter app
+        working-directory: apps/flutter
+        run: flutter test
+
+      - name: Build Windows app
+        working-directory: apps/flutter
+        run: flutter build windows --release
+
+      - name: Bundle Visual C++ runtime
+        shell: pwsh
+        run: |
+          $release = Join-Path $env:GITHUB_WORKSPACE "apps\flutter\build\windows\x64\runner\Release"
+          $roots = @(
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Professional\VC\Redist\MSVC",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC"
+          ) | Where-Object { Test-Path $_ }
+          $names = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+          foreach ($name in $names) {
+            $file = Get-ChildItem -Path $roots -Recurse -Filter $name -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "\\x64\\" } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $file) {
+              throw "Missing $name"
+            }
+            Copy-Item $file.FullName (Join-Path $release $name) -Force
+          }
+
+      - name: Verify Windows bundle
+        shell: pwsh
+        run: |
+          $release = Join-Path $env:GITHUB_WORKSPACE "apps\flutter\build\windows\x64\runner\Release"
+          $app = Join-Path $release "Hash Killer.exe"
+          $core = Join-Path $release "hash-killer.exe"
+          if (-not (Test-Path $app)) {
+            throw "Missing Hash Killer.exe"
+          }
+          if (-not (Test-Path $core)) {
+            throw "Missing hash-killer.exe"
+          }
+          '{"command":"load_settings"}' | & $core --bridge-json
+
+      - name: Archive Windows bundle
+        shell: pwsh
+        run: |
+          $release = Join-Path $env:GITHUB_WORKSPACE "apps\flutter\build\windows\x64\runner\Release"
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $zip = Join-Path $dist "hash-killer-windows.zip"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
+          Compress-Archive -Path "$release\*" -DestinationPath $zip -Force
+          Get-FileHash $zip -Algorithm SHA256
+
+      - name: Upload Windows bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: hash-killer-windows
+          path: dist/hash-killer-windows.zip

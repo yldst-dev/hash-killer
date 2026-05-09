@@ -2365,6 +2365,8 @@ dependencies = [
  "rfd",
  "rusqlite",
  "same-file",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "unicode-normalization",
 ]

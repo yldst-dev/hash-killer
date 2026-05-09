@@ -6,14 +6,22 @@ mod components;
 mod duplicate_cleaner;
 mod hash_algorithm;
 mod icons;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_bridge;
 mod quarantine;
 mod reporting;
 mod scan_mode;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
-    let paths = std::env::args_os()
-        .skip(1)
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+
+    if args.first().is_some_and(|arg| arg == "--bridge-json") {
+        std::process::exit(native_bridge::run_stdio());
+    }
+
+    let paths = args
+        .into_iter()
         .map(std::path::PathBuf::from)
         .collect::<Vec<_>>();
 
