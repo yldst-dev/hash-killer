@@ -97,8 +97,143 @@ jobs:
           Compress-Archive -Path "$release\*" -DestinationPath $zip -Force
           Get-FileHash $zip -Algorithm SHA256
 
-      - name: Upload Windows bundle
+      - name: Create single Windows exe
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $zip = Join-Path $dist "hash-killer-windows.zip"
+          $source = Join-Path $env:RUNNER_TEMP "HashKillerSfx.cs"
+          $stub = Join-Path $env:RUNNER_TEMP "HashKillerSfx.exe"
+          $exe = Join-Path $dist "Hash Killer.exe"
+          $icon = Join-Path $env:GITHUB_WORKSPACE "apps\flutter\windows\runner\resources\app_icon.ico"
+          @'
+          using System;
+          using System.Diagnostics;
+          using System.IO;
+          using System.IO.Compression;
+          using System.Linq;
+          using System.Reflection;
+          using System.Security.Cryptography;
+          using System.Text;
+          using System.Windows.Forms;
+
+          internal static class Program
+          {
+              private const string Marker = "HASHKILLERSFX1";
+
+              [STAThread]
+              private static int Main(string[] args)
+              {
+                  try
+                  {
+                      var self = Assembly.GetExecutingAssembly().Location;
+                      var payload = ReadPayload(self);
+                      var hash = PayloadHash(payload).Substring(0, 16);
+                      var root = Path.Combine(Path.GetTempPath(), "HashKiller", hash);
+                      var stamp = Path.Combine(root, ".ready");
+                      var app = Path.Combine(root, "Hash Killer.exe");
+
+                      if (!File.Exists(stamp) || !File.Exists(app))
+                      {
+                          if (Directory.Exists(root))
+                          {
+                              Directory.Delete(root, true);
+                          }
+                          Directory.CreateDirectory(root);
+                          var zip = Path.Combine(root, "payload.zip");
+                          File.WriteAllBytes(zip, payload);
+                          ZipFile.ExtractToDirectory(zip, root);
+                          File.Delete(zip);
+                          File.WriteAllText(stamp, hash);
+                      }
+
+                      var start = new ProcessStartInfo
+                      {
+                          FileName = app,
+                          WorkingDirectory = root,
+                          UseShellExecute = false,
+                          Arguments = string.Join(" ", args.Select(Quote))
+                      };
+                      Process.Start(start);
+                      return 0;
+                  }
+                  catch (Exception error)
+                  {
+                      MessageBox.Show(error.ToString(), "Hash Killer", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                      return 1;
+                  }
+              }
+
+              private static byte[] ReadPayload(string path)
+              {
+                  var data = File.ReadAllBytes(path);
+                  var marker = Encoding.ASCII.GetBytes(Marker);
+                  var markerOffset = data.Length - marker.Length;
+                  if (markerOffset < 8)
+                  {
+                      throw new InvalidDataException("Payload marker is missing.");
+                  }
+                  for (var index = 0; index < marker.Length; index++)
+                  {
+                      if (data[markerOffset + index] != marker[index])
+                      {
+                          throw new InvalidDataException("Payload marker is invalid.");
+                      }
+                  }
+                  var lengthOffset = markerOffset - 8;
+                  var length = BitConverter.ToInt64(data, lengthOffset);
+                  var payloadOffset = lengthOffset - length;
+                  if (length <= 0 || payloadOffset < 0 || length > int.MaxValue)
+                  {
+                      throw new InvalidDataException("Payload length is invalid.");
+                  }
+                  var payload = new byte[length];
+                  Buffer.BlockCopy(data, (int)payloadOffset, payload, 0, (int)length);
+                  return payload;
+              }
+
+              private static string PayloadHash(byte[] payload)
+              {
+                  using (var sha = SHA256.Create())
+                  {
+                      return BitConverter.ToString(sha.ComputeHash(payload)).Replace("-", "").ToLowerInvariant();
+                  }
+              }
+
+              private static string Quote(string value)
+              {
+                  if (string.IsNullOrEmpty(value))
+                  {
+                      return "\"\"";
+                  }
+                  if (value.IndexOfAny(new[] { ' ', '\t', '"' }) < 0)
+                  {
+                      return value;
+                  }
+                  return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+              }
+          }
+          '@ | Set-Content -Path $source -Encoding UTF8
+          & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /optimize+ /win32icon:"$icon" /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll /reference:System.Windows.Forms.dll /out:"$stub" "$source"
+          if (Test-Path $exe) {
+            Remove-Item $exe -Force
+          }
+          Copy-Item $stub $exe
+          $zipBytes = [System.IO.File]::ReadAllBytes($zip)
+          $lengthBytes = [System.BitConverter]::GetBytes([int64]$zipBytes.Length)
+          $markerBytes = [System.Text.Encoding]::ASCII.GetBytes("HASHKILLERSFX1")
+          $stream = [System.IO.File]::Open($exe, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
+          try {
+            $stream.Write($zipBytes, 0, $zipBytes.Length)
+            $stream.Write($lengthBytes, 0, $lengthBytes.Length)
+            $stream.Write($markerBytes, 0, $markerBytes.Length)
+          } finally {
+            $stream.Dispose()
+          }
+          Get-FileHash $exe -Algorithm SHA256
+
+      - name: Upload Windows exe
         uses: actions/upload-artifact@v4
         with:
-          name: hash-killer-windows
-          path: dist/hash-killer-windows.zip
+          name: hash-killer-windows-exe
+          path: dist/Hash Killer.exe
