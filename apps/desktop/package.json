@@ -1,0 +1,26 @@
+{
+  "name": "hash-killer-desktop",
+  "private": true,
+  "version": "0.1.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "vue-tsc --noEmit && vite build",
+    "build:mac": "tauri build --bundles app",
+    "build:windows:portable": "tauri build --no-bundle",
+    "typecheck": "vue-tsc --noEmit",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.0",
+    "lucide-vue-next": "1.0.0",
+    "vue": "3.5.34"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.1",
+    "@vitejs/plugin-vue": "6.0.6",
+    "typescript": "5.9.3",
+    "vite": "8.0.11",
+    "vue-tsc": "3.1.8"
+  }
+}

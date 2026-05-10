@@ -4,42 +4,17 @@ version = "0.1.1"
 edition = "2021"
 
 [features]
-default = ["desktop"]
-desktop = [
-    "dioxus/lib",
-    "dioxus/launch",
-    "dioxus/devtools",
-    "dioxus/logger",
-    "dioxus/desktop",
-    "dep:blake3",
-    "dep:futures-channel",
-    "dep:futures-util",
-    "dep:jwalk",
-    "dep:md-5",
-    "dep:rayon",
-    "dep:rfd",
-    "dep:rusqlite",
-    "dep:same-file",
-    "dep:sha2",
-]
-web = ["dioxus/lib", "dioxus/launch", "dioxus/devtools", "dioxus/logger", "dioxus/web"]
+default = ["core"]
+core = []
 
 [dependencies]
-dioxus = { version = "0.7.6", default-features = false }
-unicode-normalization = "0.1.24"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-blake3 = { version = "1.8.5", features = ["rayon", "mmap"], optional = true }
-futures-channel = { version = "0.3.32", optional = true }
-futures-util = { version = "0.3.32", optional = true }
-futures-timer = "3.0.3"
-jwalk = { version = "0.8.1", optional = true }
-md-5 = { version = "0.11.0", optional = true }
-rayon = { version = "1.12.0", optional = true }
-rfd = { version = "0.17.2", optional = true }
-rusqlite = { version = "0.39.0", features = ["bundled"], optional = true }
-same-file = { version = "1.0.6", optional = true }
-sha2 = { version = "0.11.0", optional = true }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-gloo-timers = { version = "0.4.0", features = ["futures"] }
+blake3 = { version = "1.8.5", features = ["rayon", "mmap"] }
+jwalk = "0.8.1"
+md-5 = "0.11.0"
+rayon = "1.12.0"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+same-file = "1.0.6"
+serde = { version = "1.0.228", features = ["derive"] }
+sha2 = "0.11.0"

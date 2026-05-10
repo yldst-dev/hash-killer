@@ -1,10 +1,13 @@
 #[cfg(not(target_arch = "wasm32"))]
+use serde::Serialize;
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
+#[cfg_attr(not(target_arch = "wasm32"), derive(Serialize))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VolumeDestination {
     pub volume_key: String,
@@ -27,38 +30,28 @@ const SETTING_PREFIX: &str = "quarantine_target:";
 #[cfg(not(target_arch = "wasm32"))]
 pub fn volume_destinations(roots: &[String]) -> Result<Vec<VolumeDestination>, String> {
     let configured = load_target_map()?;
-    let mut grouped = HashMap::<String, Vec<PathBuf>>::new();
+    let mut root_paths = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+    root_paths.sort();
+    root_paths.dedup();
 
-    for root in roots {
-        let root_path = PathBuf::from(root);
-        grouped
-            .entry(volume_key(&root_path))
-            .or_default()
-            .push(root_path.clone());
-    }
-
-    let mut destinations = grouped
+    let mut destinations = root_paths
         .into_iter()
-        .map(|(target_volume_key, mut root_paths)| {
-            root_paths.sort();
-            root_paths.dedup();
-            let root_path = root_paths.first().cloned().unwrap_or_default();
-            let configured_path = configured.get(&target_volume_key).cloned();
+        .map(|root_path| {
+            let target_root_key = root_key(&root_path);
+            let configured_path = configured.get(&target_root_key).cloned();
             let valid_configured = configured_path
                 .as_ref()
-                .is_some_and(|path| target_volume_key == volume_key(path));
+                .is_some_and(|path| volume_key(&root_path) == volume_key(path));
             let target_path = configured_path
                 .filter(|_| valid_configured)
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "지정되지 않음".to_string());
+            let root_path = root_path.display().to_string();
 
             VolumeDestination {
-                volume_key: target_volume_key,
-                root_path: root_path.display().to_string(),
-                root_paths: root_paths
-                    .into_iter()
-                    .map(|path| path.display().to_string())
-                    .collect(),
+                volume_key: target_root_key,
+                root_path: root_path.clone(),
+                root_paths: vec![root_path],
                 target_path,
                 configured: valid_configured,
             }
@@ -76,7 +69,9 @@ pub fn volume_destinations(_roots: &[String]) -> Result<Vec<VolumeDestination>, 
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_destination(target_volume_key: &str, target_path: &Path) -> Result<(), String> {
-    if target_volume_key != volume_key(target_path) {
+    let root_path = PathBuf::from(target_volume_key);
+
+    if volume_key(&root_path) != volume_key(target_path) {
         return Err("보관 폴더는 해당 검사 경로와 같은 디스크에 있어야 합니다.".to_string());
     }
 
@@ -126,12 +121,12 @@ pub fn build_target_map(roots: &[PathBuf]) -> Result<HashMap<String, PathBuf>, S
 
     for destination in destinations {
         if !destination.configured {
-            return Err("모든 디스크의 보관 폴더를 먼저 지정하십시오.".to_string());
+            return Err("모든 검사 폴더의 보관 폴더를 먼저 지정하십시오.".to_string());
         }
 
         let target = PathBuf::from(destination.target_path);
 
-        if destination.volume_key != volume_key(&target) {
+        if volume_key(Path::new(&destination.volume_key)) != volume_key(&target) {
             return Err("보관 폴더는 검사 경로와 같은 디스크에 있어야 합니다.".to_string());
         }
 
@@ -158,6 +153,14 @@ pub fn volume_key(path: &Path) -> String {
         .unwrap_or(path);
 
     platform_volume_key(probe)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn root_key(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 #[cfg(all(not(target_arch = "wasm32"), unix))]

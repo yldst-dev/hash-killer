@@ -7,6 +7,8 @@ use rayon::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rusqlite::{params, Connection, OptionalExtension};
 #[cfg(not(target_arch = "wasm32"))]
+use serde::Serialize;
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
@@ -24,6 +26,7 @@ use std::time::UNIX_EPOCH;
 #[derive(Clone)]
 struct FileEntry {
     path: PathBuf,
+    root_key: String,
     canonical_path: String,
     size: u64,
     modified_ns: i64,
@@ -49,6 +52,7 @@ struct HashedFile {
     reused: bool,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), derive(Serialize))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CleanReport {
     pub scanned_files: usize,
@@ -63,6 +67,7 @@ pub struct CleanReport {
     pub duplicate_relations: Vec<DuplicateRelation>,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), derive(Serialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DuplicateRelationKind {
     #[default]
@@ -70,6 +75,7 @@ pub enum DuplicateRelationKind {
     SameSizeAndHash,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), derive(Serialize))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DuplicateRelation {
     pub original_path: String,
@@ -80,6 +86,7 @@ pub struct DuplicateRelation {
     pub kind: DuplicateRelationKind,
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), derive(Serialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActivityEvent {
     pub stage: String,
@@ -173,9 +180,26 @@ pub fn clean_duplicate_paths_with_progress<F>(
 where
     F: Fn(ActivityEvent) + Send + Sync,
 {
+    clean_duplicate_paths_with_progress_and_cancel(roots, algorithm, scan_mode, progress, || false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clean_duplicate_paths_with_progress_and_cancel<F, C>(
+    roots: Vec<PathBuf>,
+    algorithm: HashAlgorithm,
+    scan_mode: ScanMode,
+    progress: F,
+    should_cancel: C,
+) -> Result<CleanReport, String>
+where
+    F: Fn(ActivityEvent) + Send + Sync,
+    C: Fn() -> bool + Send + Sync,
+{
     if roots.is_empty() {
         return Err("검사할 디렉터리를 선택해야 합니다.".to_string());
     }
+
+    ensure_not_cancelled(&should_cancel)?;
 
     progress(ActivityEvent::new(
         "검사 준비",
@@ -214,6 +238,7 @@ where
         None,
     ));
     let entries = collect_files_from_roots(&roots, &excluded_targets, &progress);
+    ensure_not_cancelled(&should_cancel)?;
     snapshot.scanned_files = entries.len();
     crate::cache::save_run_snapshot(&connection, &roots, "파일 목록 수집 완료", &snapshot)?;
     progress(ActivityEvent::with_progress(
@@ -248,6 +273,7 @@ where
     let mut missing = Vec::new();
 
     for (index, entry) in candidates.into_iter().enumerate() {
+        ensure_not_cancelled(&should_cancel)?;
         let completed = index + 1;
         if index == 0 || index.is_multiple_of(64) {
             progress(ActivityEvent::with_progress(
@@ -294,6 +320,10 @@ where
     let hashed_files: Vec<HashedFile> = missing
         .into_par_iter()
         .filter_map(|entry| {
+            if should_cancel() {
+                return None;
+            }
+
             let completed = hashed_counter.fetch_add(1, Ordering::Relaxed) + 1;
             progress(ActivityEvent::with_progress(
                 "해시 계산",
@@ -313,6 +343,7 @@ where
                 })
         })
         .collect();
+    ensure_not_cancelled(&should_cancel)?;
 
     progress(ActivityEvent::with_progress(
         "해시 저장",
@@ -340,6 +371,7 @@ where
         1,
     ));
     crate::cache::prune_hash_cache(&connection)?;
+    ensure_not_cancelled(&should_cancel)?;
 
     let mut all_hashed = cached;
     all_hashed.extend(hashed_files);
@@ -369,7 +401,8 @@ where
         0,
         all_hashed.len().max(1),
     ));
-    let deletion_result = delete_duplicate_groups(all_hashed, &quarantine_targets, &progress);
+    let deletion_result =
+        delete_duplicate_groups(all_hashed, &quarantine_targets, &progress, &should_cancel)?;
 
     let report = CleanReport {
         scanned_files: snapshot.scanned_files,
@@ -403,6 +436,15 @@ where
     ));
 
     Ok(report)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_not_cancelled(should_cancel: &(dyn Fn() -> bool + Sync)) -> Result<(), String> {
+    if should_cancel() {
+        return Err("사용자가 검사를 중지했습니다.".to_string());
+    }
+
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -463,6 +505,7 @@ fn collect_files(
     progress: &(dyn Fn(ActivityEvent) + Sync),
 ) -> Vec<FileEntry> {
     let mut seen = 0_usize;
+    let root_key = crate::quarantine::root_key(root);
     WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -505,6 +548,7 @@ fn collect_files(
 
             Some(FileEntry {
                 path,
+                root_key: root_key.clone(),
                 canonical_path,
                 size: metadata.len(),
                 modified_ns,
@@ -582,7 +626,8 @@ fn delete_duplicate_groups(
     files: Vec<HashedFile>,
     quarantine_targets: &HashMap<String, PathBuf>,
     progress: &(dyn Fn(ActivityEvent) + Sync),
-) -> DeletionResult {
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<DeletionResult, String> {
     let mut by_hash = HashMap::<(u64, String), Vec<HashedFile>>::new();
 
     for file in files {
@@ -605,6 +650,7 @@ fn delete_duplicate_groups(
     let group_total = groups.len().max(1);
 
     for (group_index, mut group) in groups.into_iter().enumerate() {
+        ensure_not_cancelled(should_cancel)?;
         group.sort_by(|left, right| left.entry.canonical_path.cmp(&right.entry.canonical_path));
         let keep = group.remove(0);
         result.kept_files += 1;
@@ -620,6 +666,7 @@ fn delete_duplicate_groups(
         ));
 
         for duplicate in group {
+            ensure_not_cancelled(should_cancel)?;
             let same_file =
                 same_file::is_same_file(&keep.entry.path, &duplicate.entry.path).unwrap_or(false);
 
@@ -657,7 +704,7 @@ fn delete_duplicate_groups(
         }
     }
 
-    result
+    Ok(result)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -683,12 +730,11 @@ fn move_to_quarantine(
     entry: &FileEntry,
     quarantine_targets: &HashMap<String, PathBuf>,
 ) -> Result<PathBuf, String> {
-    let volume_key = crate::quarantine::volume_key(&entry.path);
     let target = quarantine_targets
-        .get(&volume_key)
-        .ok_or_else(|| "해당 디스크의 보관 폴더가 없습니다.".to_string())?;
+        .get(&entry.root_key)
+        .ok_or_else(|| "해당 검사 폴더의 보관 폴더가 없습니다.".to_string())?;
 
-    if volume_key != crate::quarantine::volume_key(target) {
+    if crate::quarantine::volume_key(&entry.path) != crate::quarantine::volume_key(target) {
         return Err("보관 폴더가 원본 파일과 같은 디스크에 있지 않습니다.".to_string());
     }
 
@@ -796,6 +842,7 @@ mod tests {
         let modified_ns = modified_ns(&metadata);
         FileEntry {
             path: path.to_path_buf(),
+            root_key: crate::quarantine::root_key(path.parent().unwrap_or(path)),
             canonical_path: fs::canonicalize(path).unwrap().display().to_string(),
             size: metadata.len(),
             modified_ns,
@@ -861,10 +908,7 @@ mod tests {
         let entry = entry_for(&duplicate);
         write_file(&duplicate, b"after-change");
         let mut targets = HashMap::new();
-        targets.insert(
-            crate::quarantine::volume_key(&duplicate),
-            quarantine.clone(),
-        );
+        targets.insert(entry.root_key.clone(), quarantine.clone());
 
         let result = move_to_quarantine(&entry, &targets);
 
@@ -891,10 +935,7 @@ mod tests {
         fs::remove_file(&duplicate).unwrap();
         symlink(&outside_file, &duplicate).unwrap();
         let mut targets = HashMap::new();
-        targets.insert(
-            crate::quarantine::volume_key(&duplicate),
-            quarantine.clone(),
-        );
+        targets.insert(entry.root_key.clone(), quarantine.clone());
 
         let result = move_to_quarantine(&entry, &targets);
 
@@ -930,9 +971,9 @@ mod tests {
             },
         ];
         let mut targets = HashMap::new();
-        targets.insert(crate::quarantine::volume_key(&root), quarantine);
+        targets.insert(crate::quarantine::root_key(&root), quarantine);
 
-        let result = delete_duplicate_groups(files, &targets, &|_| {});
+        let result = delete_duplicate_groups(files, &targets, &|_| {}, &|| false).unwrap();
 
         assert_eq!(result.deleted_files, 0);
         assert_eq!(result.reclaimed_bytes, 0);
