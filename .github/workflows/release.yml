@@ -140,10 +140,20 @@ jobs:
 
       - name: Collect artifacts
         run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            tag="${{ github.event.release.tag_name }}"
+            version="${tag#v}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "repository_dispatch" ]]; then
+            version="${{ github.event.client_payload.version }}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ github.event.inputs.version }}"
+          fi
           mkdir -p dist/release
           find dist/artifacts -maxdepth 3 -type f -exec cp {} dist/release/ \;
           cd dist/release
-          sha256sum hash-killer-* > checksums.txt
+          sha256sum hash-killer-* > "hash-killer-${version}-checksums.txt"
           ls -la
 
       - name: Create GitHub release
