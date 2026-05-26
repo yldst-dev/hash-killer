@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 use gpui::{
     actions, div, point, prelude::*, px, relative, rgb, rgba, size, svg, App, Application,
     AssetSource, Bounds, ClickEvent, Context, CursorStyle, Div, FocusHandle, IntoElement,
@@ -856,11 +861,7 @@ impl HashKillerApp {
     }
 
     fn window_titlebar(&self, window: &mut Window) -> impl IntoElement {
-        let maximize_icon = if window.is_maximized() {
-            ICON_WINDOW_RESTORE_PATH
-        } else {
-            ICON_WINDOW_MAXIMIZE_PATH
-        };
+        let maximize_label = if window.is_maximized() { "▢" } else { "□" };
 
         div()
             .id("window-titlebar")
@@ -877,19 +878,19 @@ impl HashKillerApp {
                         .items_center()
                         .child(window_control_button(
                             "window-minimize",
-                            ICON_WINDOW_MINIMIZE_PATH,
+                            "_",
                             WindowControlArea::Min,
                             false,
                         ))
                         .child(window_control_button(
                             "window-maximize",
-                            maximize_icon,
+                            maximize_label,
                             WindowControlArea::Max,
                             false,
                         ))
                         .child(window_control_button(
                             "window-close",
-                            ICON_X_PATH,
+                            "X",
                             WindowControlArea::Close,
                             true,
                         )),
@@ -1929,7 +1930,7 @@ fn button(
 
 fn window_control_button(
     id: &'static str,
-    icon: &'static str,
+    label: &'static str,
     area: WindowControlArea,
     close: bool,
 ) -> gpui::Stateful<Div> {
@@ -1949,7 +1950,7 @@ fn window_control_button(
                 button.bg(color::bg_hover())
             }
         })
-        .child(svg().path(icon).w(px(12.)).h(px(12.)))
+        .child(div().text_size(px(15.)).line_height(px(15.)).child(label))
 }
 
 fn icon_box(label: &'static str, size: gpui::Pixels) -> Div {

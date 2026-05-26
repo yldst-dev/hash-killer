@@ -58,8 +58,7 @@ PLIST
     ;;
   x86_64-pc-windows-msvc)
     cp "${root_dir}/target/${target}/release/${binary_name}.exe" "${staging_dir}/Hash Killer.exe"
-    cp resources/hashkiller.ico "${staging_dir}/hashkiller.ico"
-    (cd "${staging_dir}" && 7z a "${dist_dir}/hash-killer-${version}-windows-x64.zip" "Hash Killer.exe" "hashkiller.ico" >/dev/null)
+    (cd "${staging_dir}" && 7z a "${dist_dir}/hash-killer-${version}-windows-x64.zip" "Hash Killer.exe" >/dev/null)
     ;;
   x86_64-unknown-linux-gnu)
     install -Dm755 "${root_dir}/target/${target}/release/${binary_name}" "${staging_dir}/hash-killer"
