@@ -116,7 +116,7 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-24.04
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -134,7 +134,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          gh release create "${GITHUB_REF_NAME}" dist/release/* \
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            tag="${GITHUB_REF_NAME}"
+          else
+            version="${{ github.event.inputs.version }}"
+            tag="v${version}"
+          fi
+          gh release create "${tag}" dist/release/* \
             --title "Hash Killer ${version}" \
             --notes "Hash Killer ${version} GPUI desktop release."
