@@ -2,6 +2,7 @@
 name = "hash-killer"
 version = "0.1.1"
 edition = "2021"
+build = "build.rs"
 
 [features]
 default = ["core"]
@@ -11,10 +12,22 @@ core = []
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 blake3 = { version = "1.8.5", features = ["rayon", "mmap"] }
+gpui = "0.2.2"
 jwalk = "0.8.1"
 md-5 = "0.11.0"
 rayon = "1.12.0"
+rfd = "0.17.2"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "=0.26.0"
+cocoa-foundation = "=0.2.0"
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

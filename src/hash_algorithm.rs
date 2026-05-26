@@ -53,10 +53,12 @@ impl HashAlgorithm {
 
     pub fn description(self) -> &'static str {
         match self {
-            HashAlgorithm::Blake3 => "기본값, 빠른 일반 검사에 적합",
-            HashAlgorithm::Sha256 => "범용 호환성이 높은 256비트 해시",
-            HashAlgorithm::Sha512 => "긴 다이제스트가 필요한 검사용",
-            HashAlgorithm::Md5 => "레거시 비교용, 보안 용도 아님",
+            HashAlgorithm::Blake3 => "추천: 일반 검사. 장점 빠름 / 단점 외부 검증 호환 낮음",
+            HashAlgorithm::Sha256 => "추천: 외부 검증. 장점 표준 호환 / 단점 BLAKE3보다 느림",
+            HashAlgorithm::Sha512 => "추천: 정책 요구 시. 장점 긴 해시 / 단점 일반 검사 이점 작음",
+            HashAlgorithm::Md5 => {
+                "비추천: 레거시 대조 전용. 장점 오래된 목록 호환 / 단점 충돌 취약"
+            }
         }
     }
 
@@ -67,6 +69,10 @@ impl HashAlgorithm {
             "MD5" => HashAlgorithm::Md5,
             _ => HashAlgorithm::Blake3,
         }
+    }
+
+    pub fn requires_warning(self) -> bool {
+        self == HashAlgorithm::Md5
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -134,4 +140,18 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn md5_is_available_with_warning() {
+        assert!(HashAlgorithm::all()
+            .iter()
+            .any(|algorithm| algorithm.id() == "MD5"));
+        assert_eq!(HashAlgorithm::from_id("MD5"), HashAlgorithm::Md5);
+        assert!(HashAlgorithm::Md5.requires_warning());
+    }
 }

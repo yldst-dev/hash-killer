@@ -23,6 +23,8 @@ use rusqlite::params;
 use std::fs;
 #[cfg(all(not(target_arch = "wasm32"), unix))]
 use std::os::unix::fs::MetadataExt;
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+use std::os::windows::ffi::OsStrExt;
 
 #[cfg(not(target_arch = "wasm32"))]
 const SETTING_PREFIX: &str = "quarantine_target:";
@@ -170,7 +172,75 @@ fn platform_volume_key(path: &Path) -> String {
         .unwrap_or_else(|_| path.display().to_string())
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(unix)))]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+fn platform_volume_key(path: &Path) -> String {
+    if let Some(serial) = windows_volume_serial(path) {
+        return format!("volume:{serial}");
+    }
+
+    normalized_windows_prefix(path)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+fn windows_volume_serial(path: &Path) -> Option<u32> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
+
+    let input = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut root = vec![0_u16; 32768];
+
+    unsafe {
+        if GetVolumePathNameW(input.as_ptr(), root.as_mut_ptr(), root.len() as u32) == 0 {
+            return None;
+        }
+
+        let mut serial = 0_u32;
+        if GetVolumeInformationW(
+            root.as_ptr(),
+            null_mut(),
+            0,
+            &mut serial,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            0,
+        ) == 0
+        {
+            return None;
+        }
+
+        Some(serial)
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+fn normalized_windows_prefix(path: &Path) -> String {
+    use std::path::{Component, Prefix};
+
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(disk) | Prefix::VerbatimDisk(disk) => {
+                format!("disk:{}", char::from(disk).to_ascii_uppercase())
+            }
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
+                "unc:{}\\{}",
+                server.to_string_lossy().to_ascii_lowercase(),
+                share.to_string_lossy().to_ascii_lowercase()
+            ),
+            Prefix::DeviceNS(name) | Prefix::Verbatim(name) => {
+                format!("prefix:{}", name.to_string_lossy().to_ascii_lowercase())
+            }
+        },
+        Some(component) => component.as_os_str().to_string_lossy().to_string(),
+        None => path.display().to_string(),
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(unix), not(target_os = "windows")))]
 fn platform_volume_key(path: &Path) -> String {
     path.components()
         .next()

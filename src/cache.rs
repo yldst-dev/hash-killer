@@ -8,6 +8,8 @@ use std::env;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 #[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -170,6 +172,8 @@ pub fn load_hash_algorithm_configured() -> Result<bool, String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_hash_algorithm_id(value: &str) -> Result<(), String> {
+    let normalized = value.trim().to_ascii_uppercase();
+
     let connection = open_connection()?;
     connection
         .execute(
@@ -178,7 +182,7 @@ pub fn save_hash_algorithm_id(value: &str) -> Result<(), String> {
             ON CONFLICT(key) DO UPDATE SET
                 value = excluded.value,
                 updated_at = excluded.updated_at",
-            params![value],
+            params![normalized],
         )
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -341,11 +345,31 @@ fn cache_db_path() -> Result<PathBuf, String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn state_directory() -> Result<PathBuf, String> {
-    if let Some(path) = env::var_os(STATE_DIR_ENV) {
-        return Ok(PathBuf::from(path));
+    if cfg!(debug_assertions) {
+        if let Some(path) = env::var_os(STATE_DIR_ENV) {
+            let path = PathBuf::from(path);
+            ensure_state_directory_override(&path)?;
+            return Ok(path);
+        }
     }
 
     platform_state_directory()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_state_directory_override(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("캐시 경로 환경변수가 비어 있습니다.".to_string());
+    }
+
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("캐시 경로는 심볼릭 링크가 아닌 디렉터리여야 합니다.".to_string());
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
@@ -474,26 +498,37 @@ fn ensure_file_hashes_schema(connection: &Connection) -> rusqlite::Result<()> {
         return Ok(());
     }
 
+    if !file_hashes_has_algorithm(connection)? {
+        connection.execute_batch(
+            "ALTER TABLE file_hashes RENAME TO file_hashes_legacy;
+            CREATE TABLE file_hashes (
+                path TEXT NOT NULL,
+                algorithm TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                modified_ns INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(path, algorithm)
+            );
+            INSERT OR IGNORE INTO file_hashes(path, algorithm, size, modified_ns, fingerprint, hash, updated_at)
+                SELECT path, 'BLAKE3', size, modified_ns, '', hash, updated_at
+                FROM file_hashes_legacy;
+            DROP TABLE file_hashes_legacy;",
+        )?;
+    }
+
+    if !file_hashes_has_column(connection, "fingerprint")? {
+        connection.execute_batch(
+            "ALTER TABLE file_hashes ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+
     if file_hashes_has_algorithm(connection)? {
         return Ok(());
     }
 
-    connection.execute_batch(
-        "ALTER TABLE file_hashes RENAME TO file_hashes_legacy;
-        CREATE TABLE file_hashes (
-            path TEXT NOT NULL,
-            algorithm TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            modified_ns INTEGER NOT NULL,
-            hash TEXT NOT NULL,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY(path, algorithm)
-        );
-        INSERT OR IGNORE INTO file_hashes(path, algorithm, size, modified_ns, hash, updated_at)
-            SELECT path, 'BLAKE3', size, modified_ns, hash, updated_at
-            FROM file_hashes_legacy;
-        DROP TABLE file_hashes_legacy;",
-    )
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -504,6 +539,7 @@ fn create_file_hashes_table(connection: &Connection) -> rusqlite::Result<()> {
             algorithm TEXT NOT NULL,
             size INTEGER NOT NULL,
             modified_ns INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL,
             hash TEXT NOT NULL,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY(path, algorithm)
@@ -525,11 +561,16 @@ fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> 
 
 #[cfg(not(target_arch = "wasm32"))]
 fn file_hashes_has_algorithm(connection: &Connection) -> rusqlite::Result<bool> {
+    file_hashes_has_column(connection, "algorithm")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn file_hashes_has_column(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
     let mut statement = connection.prepare("PRAGMA table_info(file_hashes)")?;
     let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
 
     for column in columns {
-        if column? == "algorithm" {
+        if column? == name {
             return Ok(true);
         }
     }

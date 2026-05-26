@@ -13,7 +13,13 @@ use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 #[cfg(all(not(target_arch = "wasm32"), unix))]
+use std::fs::OpenOptions;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::ErrorKind;
+#[cfg(all(not(target_arch = "wasm32"), unix))]
 use std::os::unix::fs::MetadataExt;
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+use std::os::windows::fs::MetadataExt;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -42,6 +48,12 @@ struct FileFingerprint {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(target_os = "windows")]
+    file_attributes: u32,
+    #[cfg(target_os = "windows")]
+    creation_time: u64,
+    #[cfg(target_os = "windows")]
+    last_write_time: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -50,6 +62,19 @@ struct HashedFile {
     entry: FileEntry,
     hash: String,
     reused: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct CollectionResult {
+    entries: Vec<FileEntry>,
+    failed_files: Vec<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum MoveDestinationError {
+    DestinationExists,
+    Other(String),
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), derive(Serialize))]
@@ -237,8 +262,10 @@ where
         "검사할 파일 목록을 수집하는 중",
         None,
     ));
-    let entries = collect_files_from_roots(&roots, &excluded_targets, &progress);
+    let collection = collect_files_from_roots(&roots, &excluded_targets, &progress);
     ensure_not_cancelled(&should_cancel)?;
+    let entries = collection.entries;
+    let mut failed_files = collection.failed_files;
     snapshot.scanned_files = entries.len();
     crate::cache::save_run_snapshot(&connection, &roots, "파일 목록 수집 완료", &snapshot)?;
     progress(ActivityEvent::with_progress(
@@ -317,7 +344,7 @@ where
     ));
 
     let hashed_counter = AtomicUsize::new(0);
-    let hashed_files: Vec<HashedFile> = missing
+    let hash_results: Vec<Result<HashedFile, String>> = missing
         .into_par_iter()
         .filter_map(|entry| {
             if should_cancel() {
@@ -333,17 +360,24 @@ where
                 completed,
                 missing_total,
             ));
-            algorithm
-                .hash_path(&entry.path)
-                .ok()
-                .map(|hash| HashedFile {
+            Some(match algorithm.hash_path(&entry.path) {
+                Ok(hash) => Ok(HashedFile {
                     entry,
                     hash,
                     reused: false,
-                })
+                }),
+                Err(error) => Err(format!("{}: {}", entry.path.display(), error)),
+            })
         })
         .collect();
     ensure_not_cancelled(&should_cancel)?;
+    let mut hashed_files = Vec::new();
+    for result in hash_results {
+        match result {
+            Ok(file) => hashed_files.push(file),
+            Err(error) => failed_files.push(error),
+        }
+    }
 
     progress(ActivityEvent::with_progress(
         "해시 저장",
@@ -401,8 +435,9 @@ where
         0,
         all_hashed.len().max(1),
     ));
-    let deletion_result =
+    let mut deletion_result =
         delete_duplicate_groups(all_hashed, &quarantine_targets, &progress, &should_cancel)?;
+    failed_files.append(&mut deletion_result.failed_files);
 
     let report = CleanReport {
         scanned_files: snapshot.scanned_files,
@@ -413,7 +448,7 @@ where
         deleted_files: deletion_result.deleted_files,
         kept_files: deletion_result.kept_files,
         reclaimed_bytes: deletion_result.reclaimed_bytes,
-        failed_files: deletion_result.failed_files,
+        failed_files,
         duplicate_relations: deletion_result.duplicate_relations,
     };
 
@@ -471,7 +506,7 @@ fn collect_files_from_roots(
     roots: &[PathBuf],
     excluded_targets: &[PathBuf],
     progress: &(dyn Fn(ActivityEvent) + Sync),
-) -> Vec<FileEntry> {
+) -> CollectionResult {
     let mut by_volume = HashMap::<String, Vec<PathBuf>>::new();
 
     for root in roots {
@@ -481,21 +516,36 @@ fn collect_files_from_roots(
             .push(root.clone());
     }
 
-    let mut entries: Vec<FileEntry> = by_volume
+    let mut results: Vec<CollectionResult> = by_volume
         .into_values()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .flat_map(|group| {
-            group
-                .into_iter()
-                .flat_map(|root| collect_files(&root, excluded_targets, progress))
-                .collect::<Vec<_>>()
+        .map(|group| {
+            let mut result = CollectionResult::default();
+            for root in group {
+                let mut collected = collect_files(&root, excluded_targets, progress);
+                result.entries.append(&mut collected.entries);
+                result.failed_files.append(&mut collected.failed_files);
+            }
+            result
         })
         .collect();
+    let mut entries = Vec::new();
+    let mut failed_files = Vec::new();
+
+    for result in &mut results {
+        entries.append(&mut result.entries);
+        failed_files.append(&mut result.failed_files);
+    }
 
     entries.sort_by(|left, right| left.canonical_path.cmp(&right.canonical_path));
     entries.dedup_by(|left, right| left.canonical_path == right.canonical_path);
-    entries
+    failed_files.sort();
+    failed_files.dedup();
+    CollectionResult {
+        entries,
+        failed_files,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -503,59 +553,74 @@ fn collect_files(
     root: &Path,
     excluded_targets: &[PathBuf],
     progress: &(dyn Fn(ActivityEvent) + Sync),
-) -> Vec<FileEntry> {
+) -> CollectionResult {
     let mut seen = 0_usize;
     let root_key = crate::quarantine::root_key(root);
-    WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_file() {
-                return None;
+    let mut result = CollectionResult::default();
+
+    for item in WalkDir::new(root).follow_links(false).into_iter() {
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(error) => {
+                result.failed_files.push(error.to_string());
+                continue;
             }
-
-            seen += 1;
-            if seen == 1 || seen.is_multiple_of(64) {
-                progress(ActivityEvent::new(
-                    "파일 검색",
-                    path.display().to_string(),
-                    Some(path.display().to_string()),
-                ));
+        };
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                result
+                    .failed_files
+                    .push(format!("{}: {}", path.display(), error));
+                continue;
             }
+        };
 
-            let metadata = fs::symlink_metadata(&path).ok()?;
-            if metadata.file_type().is_symlink() {
-                return None;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+
+        seen += 1;
+        if seen == 1 || seen.is_multiple_of(64) {
+            progress(ActivityEvent::new(
+                "파일 검색",
+                path.display().to_string(),
+                Some(path.display().to_string()),
+            ));
+        }
+
+        let canonical_path = match fs::canonicalize(&path) {
+            Ok(path) => path.to_string_lossy().to_string(),
+            Err(error) => {
+                result
+                    .failed_files
+                    .push(format!("{}: {}", path.display(), error));
+                continue;
             }
+        };
+        let canonical_path_buf = PathBuf::from(&canonical_path);
 
-            if !metadata.is_file() {
-                return None;
-            }
+        if excluded_targets
+            .iter()
+            .any(|target| canonical_path_buf.starts_with(target))
+        {
+            continue;
+        }
 
-            let canonical_path = fs::canonicalize(&path).ok()?.to_string_lossy().to_string();
-            let canonical_path_buf = PathBuf::from(&canonical_path);
+        let modified_ns = modified_ns(&metadata);
 
-            if excluded_targets
-                .iter()
-                .any(|target| canonical_path_buf.starts_with(target))
-            {
-                return None;
-            }
+        result.entries.push(FileEntry {
+            path,
+            root_key: root_key.clone(),
+            canonical_path,
+            size: metadata.len(),
+            modified_ns,
+            fingerprint: FileFingerprint::from_metadata(&metadata, modified_ns),
+        });
+    }
 
-            let modified_ns = modified_ns(&metadata);
-
-            Some(FileEntry {
-                path,
-                root_key: root_key.clone(),
-                canonical_path,
-                size: metadata.len(),
-                modified_ns,
-                fingerprint: FileFingerprint::from_metadata(&metadata, modified_ns),
-            })
-        })
-        .collect()
+    result
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -567,12 +632,13 @@ fn cached_hash(
     connection
         .query_row(
             "SELECT hash FROM file_hashes
-            WHERE path = ?1 AND algorithm = ?2 AND size = ?3 AND modified_ns = ?4",
+            WHERE path = ?1 AND algorithm = ?2 AND size = ?3 AND modified_ns = ?4 AND fingerprint = ?5",
             params![
                 entry.canonical_path,
                 algorithm.id(),
                 entry.size as i64,
-                entry.modified_ns
+                entry.modified_ns,
+                entry.fingerprint.cache_key()
             ],
             |row| row.get(0),
         )
@@ -588,11 +654,12 @@ fn save_hashes(
     let transaction = connection.transaction()?;
     {
         let mut statement = transaction.prepare(
-            "INSERT INTO file_hashes(path, algorithm, size, modified_ns, hash, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
+            "INSERT INTO file_hashes(path, algorithm, size, modified_ns, fingerprint, hash, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())
                 ON CONFLICT(path, algorithm) DO UPDATE SET
                     size = excluded.size,
                     modified_ns = excluded.modified_ns,
+                    fingerprint = excluded.fingerprint,
                     hash = excluded.hash,
                     updated_at = excluded.updated_at",
         )?;
@@ -603,6 +670,7 @@ fn save_hashes(
                 algorithm.id(),
                 file.entry.size as i64,
                 file.entry.modified_ns,
+                file.entry.fingerprint.cache_key(),
                 file.hash
             ])?;
         }
@@ -653,6 +721,12 @@ fn delete_duplicate_groups(
         ensure_not_cancelled(should_cancel)?;
         group.sort_by(|left, right| left.entry.canonical_path.cmp(&right.entry.canonical_path));
         let keep = group.remove(0);
+        if let Err(error) = verify_file_fingerprint(&keep.entry) {
+            result
+                .failed_files
+                .push(format!("{}: {}", keep.entry.path.display(), error));
+            continue;
+        }
         result.kept_files += 1;
         let group_completed = group_index + 1;
 
@@ -738,23 +812,71 @@ fn move_to_quarantine(
         return Err("보관 폴더가 원본 파일과 같은 디스크에 있지 않습니다.".to_string());
     }
 
-    fs::create_dir_all(target).map_err(|error| error.to_string())?;
-    verify_file_fingerprint(entry)?;
-
-    let destination = unique_destination(target, &entry.path);
-    if destination.symlink_metadata().is_ok() {
-        return Err("보관 위치에 같은 이름의 파일이 이미 있습니다.".to_string());
+    prepare_quarantine_target(target)?;
+    for _ in 0..1024 {
+        let destination = destination_for_move(target, &entry.path)?;
+        if let Err(error) = verify_file_fingerprint(entry) {
+            cleanup_reserved_destination(&destination);
+            return Err(error);
+        }
+        match move_to_destination(entry, &destination) {
+            Ok(()) => return Ok(destination),
+            Err(MoveDestinationError::DestinationExists) => continue,
+            Err(MoveDestinationError::Other(error)) => return Err(error),
+        }
     }
 
-    fs::rename(&entry.path, &destination).map_err(|error| error.to_string())?;
-    Ok(destination)
+    Err("사용 가능한 보관 파일명을 찾지 못했습니다.".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn prepare_quarantine_target(target: &Path) -> Result<(), String> {
+    fs::create_dir_all(target).map_err(|error| error.to_string())?;
+    let metadata = fs::symlink_metadata(target).map_err(|error| error.to_string())?;
+
+    if metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+        || !metadata.is_dir()
+    {
+        return Err("보관 폴더는 심볼릭 링크가 아닌 디렉터리여야 합니다.".to_string());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn move_to_destination(entry: &FileEntry, destination: &Path) -> Result<(), MoveDestinationError> {
+    match fs::rename(&entry.path, destination) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            #[cfg(unix)]
+            let _ = fs::remove_file(destination);
+            if error.kind() == ErrorKind::AlreadyExists {
+                Err(MoveDestinationError::DestinationExists)
+            } else {
+                Err(MoveDestinationError::Other(error.to_string()))
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cleanup_reserved_destination(destination: &Path) {
+    #[cfg(unix)]
+    let _ = fs::remove_file(destination);
+
+    #[cfg(not(unix))]
+    let _ = destination;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn verify_file_fingerprint(entry: &FileEntry) -> Result<(), String> {
     let metadata = fs::symlink_metadata(&entry.path).map_err(|error| error.to_string())?;
 
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+        || !metadata.is_file()
+    {
         return Err("중복 파일이 일반 파일이 아닙니다.".to_string());
     }
 
@@ -778,6 +900,18 @@ fn modified_ns(metadata: &fs::Metadata) -> i64 {
         .unwrap_or_default()
 }
 
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+fn metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl FileFingerprint {
     fn from_metadata(metadata: &fs::Metadata, modified_ns: i64) -> Self {
@@ -788,11 +922,67 @@ impl FileFingerprint {
             device: metadata.dev(),
             #[cfg(unix)]
             inode: metadata.ino(),
+            #[cfg(target_os = "windows")]
+            file_attributes: metadata.file_attributes(),
+            #[cfg(target_os = "windows")]
+            creation_time: metadata.creation_time(),
+            #[cfg(target_os = "windows")]
+            last_write_time: metadata.last_write_time(),
+        }
+    }
+
+    fn cache_key(&self) -> String {
+        #[cfg(unix)]
+        {
+            format!(
+                "{}:{}:{}:{}",
+                self.size, self.modified_ns, self.device, self.inode
+            )
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            format!(
+                "{}:{}:{}:{}:{}",
+                self.size,
+                self.modified_ns,
+                self.file_attributes,
+                self.creation_time,
+                self.last_write_time
+            )
+        }
+
+        #[cfg(all(not(unix), not(target_os = "windows")))]
+        {
+            format!("{}:{}", self.size, self.modified_ns)
         }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn destination_for_move(target: &Path, source: &Path) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        reserve_destination(target, source)
+    }
+
+    #[cfg(not(unix))]
+    {
+        unique_available_destination(target, source)
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(unix)))]
+fn unique_available_destination(target: &Path, source: &Path) -> Result<PathBuf, String> {
+    let destination = unique_destination(target, source);
+    if destination.symlink_metadata().is_ok() {
+        return Err("보관 위치에 같은 이름의 파일이 이미 있습니다.".to_string());
+    }
+
+    Ok(destination)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(unix)))]
 fn unique_destination(target: &Path, source: &Path) -> PathBuf {
     let file_name = source
         .file_name()
@@ -812,6 +1002,38 @@ fn unique_destination(target: &Path, source: &Path) -> PathBuf {
         }
 
         index += 1;
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+fn reserve_destination(target: &Path, source: &Path) -> Result<PathBuf, String> {
+    let file_name = source
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "duplicate-file".to_string());
+    let mut index = 0_u64;
+
+    loop {
+        let candidate = if index == 0 {
+            target.join(&file_name)
+        } else {
+            target.join(format!("{index}-{file_name}"))
+        };
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                drop(file);
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                index += 1;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
     }
 }
 
@@ -862,9 +1084,10 @@ mod tests {
 
         let files = collect_files(&root, &excluded, &|_| {});
 
-        assert_eq!(files.len(), 1);
+        assert_eq!(files.entries.len(), 1);
+        assert!(files.failed_files.is_empty());
         assert_eq!(
-            files[0].canonical_path,
+            files.entries[0].canonical_path,
             fs::canonicalize(&kept).unwrap().display().to_string()
         );
 
@@ -889,9 +1112,10 @@ mod tests {
 
         let files = collect_files(&root, &[], &|_| {});
 
-        assert_eq!(files.len(), 1);
+        assert_eq!(files.entries.len(), 1);
+        assert!(files.failed_files.is_empty());
         assert_eq!(
-            files[0].canonical_path,
+            files.entries[0].canonical_path,
             fs::canonicalize(&real).unwrap().display().to_string()
         );
 
@@ -915,6 +1139,128 @@ mod tests {
         assert!(result.is_err());
         assert!(duplicate.exists());
         assert!(!quarantine.join("duplicate.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_to_quarantine_uses_numbered_destination_when_name_exists() {
+        let root = temp_path("existing-destination");
+        let quarantine = root.join("quarantine");
+        let duplicate = root.join("duplicate.txt");
+        let existing = quarantine.join("duplicate.txt");
+        write_file(&duplicate, b"duplicate");
+        write_file(&existing, b"existing");
+        let entry = entry_for(&duplicate);
+        let mut targets = HashMap::new();
+        targets.insert(entry.root_key.clone(), quarantine.clone());
+
+        let result = move_to_quarantine(&entry, &targets).unwrap();
+
+        assert_eq!(result, quarantine.join("1-duplicate.txt"));
+        assert!(!duplicate.exists());
+        assert_eq!(fs::read(existing).unwrap(), b"existing");
+        assert_eq!(fs::read(result).unwrap(), b"duplicate");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_hash_requires_current_fingerprint() {
+        let root = temp_path("cached-fingerprint");
+        let file = root.join("file.txt");
+        write_file(&file, b"same");
+        let entry = entry_for(&file);
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE file_hashes (
+                    path TEXT NOT NULL,
+                    algorithm TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    modified_ns INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    hash TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(path, algorithm)
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO file_hashes(path, algorithm, size, modified_ns, fingerprint, hash, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                params![
+                    entry.canonical_path,
+                    HashAlgorithm::Blake3.id(),
+                    entry.size as i64,
+                    entry.modified_ns,
+                    "stale",
+                    "old-hash"
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            cached_hash(&connection, &entry, HashAlgorithm::Blake3).unwrap(),
+            None
+        );
+
+        connection
+            .execute(
+                "UPDATE file_hashes SET fingerprint = ?1 WHERE path = ?2 AND algorithm = ?3",
+                params![
+                    entry.fingerprint.cache_key(),
+                    entry.canonical_path,
+                    HashAlgorithm::Blake3.id()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            cached_hash(&connection, &entry, HashAlgorithm::Blake3).unwrap(),
+            Some("old-hash".to_string())
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_duplicate_groups_skips_group_when_keep_file_changed() {
+        let root = temp_path("changed-keep");
+        let quarantine = root.join("quarantine");
+        let keep = root.join("a.txt");
+        let duplicate = root.join("b.txt");
+        write_file(&keep, b"same");
+        write_file(&duplicate, b"same");
+        let keep_entry = entry_for(&keep);
+        let duplicate_entry = entry_for(&duplicate);
+        fs::remove_file(&keep).unwrap();
+        let mut targets = HashMap::new();
+        targets.insert(keep_entry.root_key.clone(), quarantine);
+
+        let result = delete_duplicate_groups(
+            vec![
+                HashedFile {
+                    entry: keep_entry,
+                    hash: "hash".to_string(),
+                    reused: false,
+                },
+                HashedFile {
+                    entry: duplicate_entry,
+                    hash: "hash".to_string(),
+                    reused: false,
+                },
+            ],
+            &targets,
+            &|_| {},
+            &|| false,
+        )
+        .unwrap();
+
+        assert_eq!(result.deleted_files, 0);
+        assert_eq!(result.failed_files.len(), 1);
+        assert!(duplicate.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -943,6 +1289,33 @@ mod tests {
         assert!(outside_file.exists());
         assert!(duplicate.exists());
         assert!(!quarantine.join("duplicate.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_to_quarantine_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("symlink-target");
+        let outside = temp_path("outside-symlink-target");
+        let duplicate = root.join("duplicate.txt");
+        let real_target = outside.join("real-target");
+        let symlink_target = root.join("quarantine-link");
+        write_file(&duplicate, b"duplicate");
+        fs::create_dir_all(&real_target).unwrap();
+        symlink(&real_target, &symlink_target).unwrap();
+        let entry = entry_for(&duplicate);
+        let mut targets = HashMap::new();
+        targets.insert(entry.root_key.clone(), symlink_target.clone());
+
+        let result = move_to_quarantine(&entry, &targets);
+
+        assert!(result.is_err());
+        assert!(duplicate.exists());
+        assert!(!real_target.join("duplicate.txt").exists());
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
