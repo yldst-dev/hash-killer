@@ -7,6 +7,9 @@ on:
   release:
     types:
       - created
+  repository_dispatch:
+    types:
+      - release_1_0_0
   workflow_dispatch:
     inputs:
       version:
@@ -99,6 +102,8 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
             release_tag="${{ github.event.release.tag_name }}"
             echo "RELEASE_VERSION=${release_tag#v}" >> "${GITHUB_ENV}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "repository_dispatch" ]]; then
+            echo "RELEASE_VERSION=${{ github.event.client_payload.version }}" >> "${GITHUB_ENV}"
           elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "${GITHUB_ENV}"
           else
@@ -122,7 +127,7 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-24.04
-    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' || github.event_name == 'release' || github.event_name == 'repository_dispatch'
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -143,8 +148,9 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
             tag="${{ github.event.release.tag_name }}"
             version="${tag#v}"
-            gh release upload "${tag}" dist/release/* --clobber
-            exit 0
+          elif [[ "${GITHUB_EVENT_NAME}" == "repository_dispatch" ]]; then
+            version="${{ github.event.client_payload.version }}"
+            tag="v${version}"
           elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
             tag="${GITHUB_REF_NAME}"
@@ -152,6 +158,10 @@ jobs:
             version="${{ github.event.inputs.version }}"
             tag="v${version}"
           fi
-          gh release create "${tag}" dist/release/* \
-            --title "Hash Killer ${version}" \
-            --notes "Hash Killer ${version} GPUI desktop release."
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/release/* --clobber
+          else
+            gh release create "${tag}" dist/release/* \
+              --title "Hash Killer ${version}" \
+              --notes "Hash Killer ${version} GPUI desktop release."
+          fi
