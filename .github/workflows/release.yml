@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without v prefix"
+        required: true
+        default: "1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            artifact: hash-killer-*-macos-arm64.zip
+          - name: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: hash-killer-*-windows-x64.zip
+          - name: Linux x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: hash-killer-*-linux-x64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+
+      - name: Configure Windows shader compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter fxc.exe | Where-Object { $_.FullName -match "\\x64\\fxc.exe$" } | Select-Object -First 1
+          if (-not $fxc) { throw "fxc.exe not found" }
+          "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Check macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          xcode-select -p
+          xcrun --find metal
+          xcrun --find metallib
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            gcc \
+            g++ \
+            libasound2-dev \
+            libfontconfig-dev \
+            libfreetype6-dev \
+            libglib2.0-dev \
+            libssl-dev \
+            libvulkan1 \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libzstd-dev \
+            lld \
+            mesa-vulkan-drivers \
+            pkg-config \
+            wayland-protocols \
+            zip
+
+      - name: Set release version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "${GITHUB_ENV}"
+          else
+            echo "RELEASE_VERSION=${{ github.event.inputs.version }}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin hash-killer
+
+      - name: Package
+        shell: bash
+        run: scripts/package-release.sh "${{ matrix.target }}" "${RELEASE_VERSION}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hash-killer-${{ matrix.target }}
+          path: dist/release/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist/release
+          find dist/artifacts -maxdepth 3 -type f -exec cp {} dist/release/ \;
+          cd dist/release
+          sha256sum hash-killer-* > checksums.txt
+          ls -la
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "${GITHUB_REF_NAME}" dist/release/* \
+            --title "Hash Killer ${version}" \
+            --notes "Hash Killer ${version} GPUI desktop release."

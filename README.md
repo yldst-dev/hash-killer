@@ -81,6 +81,20 @@ GPUI 앱만 확인할 때는 다음 명령을 사용할 수 있습니다.
 cargo check --bin hash-killer
 ```
 
+## 릴리즈
+
+릴리즈는 `v1.0.0`처럼 `v` 접두사가 붙은 태그를 푸시하면 GitHub Actions에서 생성됩니다.
+
+생성되는 산출물은 다음과 같습니다.
+
+| 플랫폼 | 산출물 |
+| --- | --- |
+| macOS arm64 | `hash-killer-1.0.0-macos-arm64.zip` |
+| Windows x64 | `hash-killer-1.0.0-windows-x64.zip` |
+| Linux x64 | `hash-killer-1.0.0-linux-x64.tar.gz` |
+
+릴리즈에는 각 산출물의 SHA-256 체크섬 파일도 함께 첨부됩니다.
+
 ## 앱 사용 흐름
 
 1. `폴더 선택`으로 검사할 폴더를 추가합니다.
