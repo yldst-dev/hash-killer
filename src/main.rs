@@ -840,7 +840,9 @@ impl HashKillerApp {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .child(self.window_titlebar(window))
+                    .when(!cfg!(target_os = "windows"), |root| {
+                        root.child(self.window_titlebar(window))
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -861,7 +863,11 @@ impl HashKillerApp {
     }
 
     fn window_titlebar(&self, window: &mut Window) -> impl IntoElement {
-        let maximize_label = if window.is_maximized() { "▢" } else { "□" };
+        let maximize_icon = if window.is_maximized() {
+            ICON_WINDOW_RESTORE_PATH
+        } else {
+            ICON_WINDOW_MAXIMIZE_PATH
+        };
 
         div()
             .id("window-titlebar")
@@ -878,19 +884,19 @@ impl HashKillerApp {
                         .items_center()
                         .child(window_control_button(
                             "window-minimize",
-                            "_",
+                            ICON_WINDOW_MINIMIZE_PATH,
                             WindowControlArea::Min,
                             false,
                         ))
                         .child(window_control_button(
                             "window-maximize",
-                            maximize_label,
+                            maximize_icon,
                             WindowControlArea::Max,
                             false,
                         ))
                         .child(window_control_button(
                             "window-close",
-                            "X",
+                            ICON_X_PATH,
                             WindowControlArea::Close,
                             true,
                         )),
@@ -1930,7 +1936,7 @@ fn button(
 
 fn window_control_button(
     id: &'static str,
-    label: &'static str,
+    icon: &'static str,
     area: WindowControlArea,
     close: bool,
 ) -> gpui::Stateful<Div> {
@@ -1950,7 +1956,7 @@ fn window_control_button(
                 button.bg(color::bg_hover())
             }
         })
-        .child(div().text_size(px(15.)).line_height(px(15.)).child(label))
+        .child(svg().path(icon).w(px(12.)).h(px(12.)))
 }
 
 fn icon_box(label: &'static str, size: gpui::Pixels) -> Div {
@@ -2672,10 +2678,18 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(window_size),
                     is_resizable: true,
-                    titlebar: Some(TitlebarOptions {
-                        title: None,
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(16.0), px(17.0))),
+                    titlebar: Some(if cfg!(target_os = "windows") {
+                        TitlebarOptions {
+                            title: Some("Hash Killer".into()),
+                            appears_transparent: false,
+                            traffic_light_position: None,
+                        }
+                    } else {
+                        TitlebarOptions {
+                            title: None,
+                            appears_transparent: true,
+                            traffic_light_position: Some(point(px(16.0), px(17.0))),
+                        }
                     }),
                     ..Default::default()
                 },
